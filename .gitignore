@@ -225,3 +225,6 @@ data/
 
 # personal study notes (not part of the project)
 notes/
+
+# training outputs (the final weights will be added explicitly at the end)
+checkpoints/*.pt
