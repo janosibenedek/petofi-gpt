@@ -3,6 +3,7 @@
 Classes:
   GPTConfig            all hyperparameters of the architecture (stored in every checkpoint)
   CausalSelfAttention  multi-head masked self-attention
+  DiffCausalSelfAttention  differential attention (Ye et al., 2024): difference of two softmax maps
   MLP                  position-wise feed-forward network
   Block                pre-norm Transformer block:  x + attn(ln1(x)),  then  x + mlp(ln2(x))
   GPT                  embeddings -> blocks -> final LayerNorm -> language-model head
@@ -31,7 +32,7 @@ class GPTConfig:
     dropout: float = 0.1          # dropout probability (regularization, active only in train mode)
     activation: str = "gelu"      # MLP nonlinearity: "gelu" or "relu"           (ablation)
     residual: bool = True         # False removes the skip connections           (ablation)
-    attention: str = "standard"   # "standard"; "diff" will be added in a later commit
+    attention: str = "standard"   # "standard" or "diff" (Differential Transformer)
 
     def __post_init__(self):
         """Runs automatically after the generated __init__: reject invalid settings early."""
@@ -39,8 +40,10 @@ class GPTConfig:
             raise ValueError(f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})")
         if self.activation not in ("gelu", "relu"):
             raise ValueError(f"unknown activation: {self.activation!r}")
-        if self.attention != "standard":
+        if self.attention not in ("standard", "diff"):
             raise ValueError(f"unknown attention type: {self.attention!r}")
+        if self.attention == "diff" and self.n_head % 2 != 0:
+            raise ValueError("differential attention needs an even n_head (uses n_head // 2 heads)")
 
 
 # Architecture presets; use them as  GPTConfig(vocab_size=V, **PRESETS["cpu"])
@@ -91,6 +94,76 @@ class CausalSelfAttention(nn.Module):
         return self.resid_drop(self.proj(y))                            # (B, T, C)
 
 
+def lambda_init_fn(layer_idx: int) -> float:
+    """Initial lambda of the Differential Transformer paper: 0.8 - 0.6 * exp(-0.3 * (l - 1)),
+    with l = 1, 2, ... (here layer_idx = l - 1 starts at 0): 0.2 in the first layer -> ~0.8 deep."""
+    return 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+
+
+class DiffCausalSelfAttention(nn.Module):
+    """Differential attention (Ye et al., 2024, "Differential Transformer").
+
+    Every head computes TWO softmax maps from two query/key pairs and subtracts them:
+        A = softmax(Q1 K1^T / sqrt(d)) - lambda * softmax(Q2 K2^T / sqrt(d))
+    Attention that both maps give to irrelevant positions ("noise") cancels out,
+    like the common-mode noise in a differential amplifier.
+    It uses n_head // 2 heads, each twice as wide, so the parameter count stays (almost) equal
+    to the standard attention: only lambda's 4 vectors and the per-head RMSNorm are new.
+    """
+
+    def __init__(self, config: GPTConfig, layer_idx: int):
+        super().__init__()
+        self.n_head = config.n_head // 2                  # half as many heads ...
+        self.head_size = config.n_embd // config.n_head   # d: size of Q1, Q2, K1, K2 (V has 2d)
+        d = self.head_size
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd)   # same matrices as standard
+        self.proj = nn.Linear(config.n_embd, config.n_embd)
+        self.attn_drop = nn.Dropout(config.dropout)
+        self.resid_drop = nn.Dropout(config.dropout)
+        # lambda = exp(lq1 . lk1) - exp(lq2 . lk2) + lambda_init : a learnable scalar per layer
+        self.lambda_init = lambda_init_fn(layer_idx)
+        self.lambda_q1 = nn.Parameter(torch.randn(d) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(d) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(d) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(d) * 0.1)
+        self.subln = nn.RMSNorm(2 * d, eps=1e-5)          # per-head normalization of the output
+        mask = torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size),
+                             persistent=False)
+        self.store_attention = False
+        self.last_att = None            # (B, h, T, T) DIFFERENTIAL map: may contain negative values
+        self.last_lambda = None
+
+    def lambda_value(self) -> torch.Tensor:
+        return (torch.exp((self.lambda_q1 * self.lambda_k1).sum())
+                - torch.exp((self.lambda_q2 * self.lambda_k2).sum()) + self.lambda_init)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        h, d = self.n_head, self.head_size
+        q, k, v = self.qkv(x).split(C, dim=2)                           # 3 x (B, T, C)
+        # every head gets two queries and two keys of size d:
+        # (B, T, C) -> (B, T, h, 2, d) -> (B, h, 2, T, d)
+        q = q.view(B, T, h, 2, d).permute(0, 2, 3, 1, 4)
+        k = k.view(B, T, h, 2, d).permute(0, 2, 3, 1, 4)
+        v = v.view(B, T, h, 2 * d).transpose(1, 2)                      # (B, h, T, 2d)
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(d)                  # (B, h, 2, T, T)
+        att = att.masked_fill(~self.mask[:, :, :T, :T], float("-inf"))  # same causal mask
+        att = F.softmax(att, dim=-1)                                    # two maps per head
+        lam = self.lambda_value()
+        att = att[:, :, 0] - lam * att[:, :, 1]                         # (B, h, T, T) difference
+        if self.store_attention:
+            self.last_att = att.detach()
+            self.last_lambda = lam.item()
+        att = self.attn_drop(att)
+
+        y = att @ v                                                     # (B, h, T, 2d)
+        y = self.subln(y) * (1 - self.lambda_init)                      # per-head norm, rescale
+        y = y.transpose(1, 2).contiguous().view(B, T, C)                # concatenate the heads
+        return self.resid_drop(self.proj(y))
+
+
 class MLP(nn.Module):
     """Feed-forward network applied to every position separately: C -> 4C -> C."""
 
@@ -108,10 +181,11 @@ class MLP(nn.Module):
 class Block(nn.Module):
     """Pre-norm Transformer block: attention collects context, the MLP processes it."""
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, layer_idx: int = 0):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.attn = (DiffCausalSelfAttention(config, layer_idx) if config.attention == "diff"
+                     else CausalSelfAttention(config))
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
         self.residual = config.residual
@@ -135,7 +209,7 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)   # which character
         self.pos_emb = nn.Embedding(config.block_size, config.n_embd)   # where in the context
         self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([Block(config, i) for i in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # C -> V logits
         self.apply(self._init_weights)        # calls _init_weights on every submodule
@@ -220,26 +294,32 @@ def _self_test() -> None:
           f"(expected ~ ln {V} = {math.log(V):.3f})")
     assert abs(loss.item() - math.log(V)) < 0.1
 
-    # 2) causality: changing the LAST character must not change the outputs before it
-    model.eval()
-    changed = idx.clone()
-    changed[:, -1] = (changed[:, -1] + 1) % V
-    out_a, _ = model(idx)
-    out_b, _ = model(changed)
-    assert torch.allclose(out_a[:, :-1], out_b[:, :-1]), "future token leaked into the past!"
-    assert not torch.allclose(out_a[:, -1], out_b[:, -1])
-    print("2) causality OK: positions 0..T-2 do not see the last character")
+    for attention in ("standard", "diff"):
+        m = model if attention == "standard" else GPT(replace(cfg, attention="diff"))
+        m.eval()
 
-    # 3) attention maps: one per layer, zero above the diagonal, rows sum to 1
-    model.set_store_attention(True)
-    model(idx)
-    maps = model.attention_maps()
-    assert len(maps) == cfg.n_layer and maps[0].shape == (B, cfg.n_head, T, T)
-    upper = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
-    assert torch.all(maps[0][..., upper] == 0)
-    assert torch.allclose(maps[0].sum(-1), torch.ones(B, cfg.n_head, T))
-    model.set_store_attention(False)
-    print(f"3) attention maps OK: {len(maps)} x {tuple(maps[0].shape)}")
+        # 2) causality: changing the LAST character must not change the outputs before it
+        changed = idx.clone()
+        changed[:, -1] = (changed[:, -1] + 1) % V
+        out_a, _ = m(idx)
+        out_b, _ = m(changed)
+        assert torch.allclose(out_a[:, :-1], out_b[:, :-1]), "future token leaked into the past!"
+        assert not torch.allclose(out_a[:, -1], out_b[:, -1])
+
+        # 3) attention maps: one per layer, zero above the diagonal; rows sum to 1 (standard)
+        #    or to 1 - lambda (differential: difference of two maps that both sum to 1)
+        m.set_store_attention(True)
+        m(idx)
+        maps = m.attention_maps()
+        nh = cfg.n_head if attention == "standard" else cfg.n_head // 2
+        assert len(maps) == cfg.n_layer and maps[0].shape == (B, nh, T, T)
+        upper = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+        assert torch.all(maps[0][..., upper] == 0)
+        row_sum = 1.0 if attention == "standard" else 1.0 - m.blocks[0].attn.last_lambda
+        assert torch.allclose(maps[0].sum(-1), torch.full((B, nh, T), row_sum), atol=1e-5)
+        m.set_store_attention(False)
+        print(f"2-3) {attention:8}: causality OK, attention maps {len(maps)} x "
+              f"{tuple(maps[0].shape)}, rows sum to {row_sum:.3f}")
 
     # 4) generation, also beyond block_size (the context window is cropped)
     out = model.generate(idx[:1, :3], max_new_tokens=2 * T, temperature=0.8, top_k=10)
@@ -247,26 +327,29 @@ def _self_test() -> None:
     print(f"4) generate OK: {tuple(out.shape)}")
 
     # 5) the ablation variants build and run
-    for kwargs in (dict(activation="relu"), dict(residual=False)):
+    for kwargs in (dict(activation="relu"), dict(residual=False), dict(attention="diff")):
         GPT(replace(cfg, **kwargs))(idx, targets)        # replace: copy of cfg with changes
-    print("5) ablations OK: activation='relu', residual=False")
+    print("5) variants OK: activation='relu', residual=False, attention='diff'")
 
     # 6) the model can memorize one fixed batch (if not, backprop is broken somewhere)
-    model.train()
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    start = model(idx, targets)[1].item()
-    for _ in range(150):
-        _, loss = model(idx, targets)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-    print(f"6) overfitting one batch: loss {start:.2f} -> {loss.item():.2f}")
-    assert loss.item() < 1.0
+    for attention in ("standard", "diff"):
+        torch.manual_seed(0)
+        m = GPT(replace(cfg, attention=attention))
+        opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+        start = m(idx, targets)[1].item()
+        for _ in range(150):
+            _, loss = m(idx, targets)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        print(f"6) {attention:8}: overfitting one batch: loss {start:.2f} -> {loss.item():.2f}")
+        assert loss.item() < 1.0
 
     # 7) size of the presets
     for name, preset in PRESETS.items():
-        n = GPT(GPTConfig(vocab_size=V, **preset)).num_params()
-        print(f"7) preset {name!r}: {n:,} parameters")
+        for attention in ("standard", "diff"):
+            n = GPT(GPTConfig(vocab_size=V, attention=attention, **preset)).num_params()
+            print(f"7) preset {name!r:8} {attention:8}: {n:,} parameters")
     print("All tests passed.")
 
 

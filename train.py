@@ -14,6 +14,7 @@ Usage:
   python train.py --preset colab                 # GPU run on Colab
   python train.py --activation relu              # ablation: ReLU instead of GELU
   python train.py --no-residual                  # ablation: no skip connections
+  python train.py --attention diff               # main experiment: Differential Transformer
   python train.py --max-iters 200                # quick smoke test
 """
 import argparse
@@ -106,6 +107,8 @@ def default_name(args) -> str:
         name += f"_{args.activation}"
     if args.no_residual:
         name += "_nores"
+    if args.attention != "standard":
+        name += f"_{args.attention}"
     return name
 
 
@@ -114,6 +117,7 @@ def parse_args():
     p.add_argument("--preset", choices=PRESETS, default="cpu")
     p.add_argument("--activation", choices=("gelu", "relu"), default="gelu")
     p.add_argument("--no-residual", action="store_true")
+    p.add_argument("--attention", choices=("standard", "diff"), default="standard")
     p.add_argument("--dropout", type=float, default=None, help="override the preset's dropout")
     p.add_argument("--batch-size", type=int)
     p.add_argument("--lr", type=float, help="peak learning rate")
@@ -161,7 +165,7 @@ def main() -> None:
     if args.dropout is not None:
         arch["dropout"] = args.dropout
     config = GPTConfig(vocab_size=len(vocab), activation=args.activation,
-                       residual=not args.no_residual, **arch)
+                       residual=not args.no_residual, attention=args.attention, **arch)
     model = GPT(config).to(device)
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
 
