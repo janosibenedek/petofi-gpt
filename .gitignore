@@ -226,5 +226,5 @@ data/
 # personal study notes (not part of the project)
 notes/
 
-# training outputs (the final weights will be added explicitly at the end)
+# training outputs (the trained weights are published as a GitHub Release)
 checkpoints/*.pt
