@@ -144,6 +144,8 @@ python model.py           # a modell öntesztje
 
 A forrásfájl ujjlenyomata (SHA-256) a `data/meta.json`-ba kerül. Ha ez `aa7655a76f03…`-mal kezdődik, a felosztás pontosan ugyanaz, mint a projektben.
 
+Ha a Project Gutenberg éppen nem érhető el, a forrásfájl (`pg41504.txt`) a [Releases](https://github.com/janosibenedek/petofi-gpt/releases/latest) oldalról is letölthető. Tedd a repó mappájába, és futtasd így: `python prepare_data.py --raw-file pg41504.txt`.
+
 **Tanítás:**
 
 ```bash
