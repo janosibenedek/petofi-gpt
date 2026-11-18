@@ -17,6 +17,32 @@ A modell betűről betűre ír, és senki nem tanította meg neki a szavakat, a 
 
 ---
 
+## Gyors teszt (kb. 5 perc, GPU nélkül)
+
+Ha csak ki szeretnéd próbálni a modellt. A teljes reprodukálás (adat, tanítás, elemzés) a [Futtatás](#futtatás) részben van.
+
+```bash
+git clone https://github.com/janosibenedek/petofi-gpt.git
+cd petofi-gpt
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # PyTorch CPU-s változata (kisebb letöltés)
+pip install -r requirements.txt
+
+python model.py              # a modell öntesztje
+python download.py --quick   # a kis modell letöltése (cpu.pt, 3 MB)
+python generate.py --checkpoint checkpoints/cpu.pt --prompt "Szabadság, szerelem!\n"
+```
+
+Ugyanez a végleges, nagy modellel:
+
+```bash
+python download.py --final   # a két végleges modell (2 × 43 MB)
+python generate.py --checkpoint checkpoints/colab_drop03.pt --prompt "Szabadság, szerelem!\n"
+```
+
+Ajánlott Python 3.12, külön környezetben (lásd [Futtatás](#futtatás)).
+
+---
+
 ## Eredmények
 
 | Modell | Paraméter | Test loss ↓ | 95% CI | Perplexity ↓ |
@@ -60,7 +86,7 @@ A modell betűről betűre ír, és senki nem tanította meg neki a szavakat, a 
 
 - **Residual kapcsolat nélkül a modell nem tanul:** megreked a betűgyakoriság szintjén (perplexity ~30). Mély hálózatban a residual kapcsolat viszi át a jelet és a gradienst a rétegeken.
 - **ReLU vs. GELU:** a ReLU-s változat egy hajszállal jobb (kb. 0,65%), de ez egyetlen tanításból jön, ezért a kettőt gyakorlatilag egyenértékűnek tekintjük.
-- **Méret:** a 10,8 milliós modell mind a 117 versben jobb a 0,8 milliósnál.
+- **Méret:** a 10,8 milliós modell mind a 117 versben jobb a 0,8 milliósnál. A kis modell tanítása viszont a lépéskeret végén állt le (lásd [Korlátok](#korlátok)), így ez a különbség részben a tanítás hosszából is adódik.
 
 ![Tanulási görbék](results/figures/learning_curves.png)
 
@@ -105,6 +131,8 @@ flowchart LR
     C --> D["train.py<br/>GPT és DIFF tanítása"]
     C --> E["ngram_baseline.py<br/>N-gram alapmodell"]
     D --> F["checkpoints/*.pt"]
+    R["GitHub Release"] --> S["download.py<br/>letöltés"]
+    S --> F
     F --> G["generate.py<br/>szöveggenerálás"]
     F --> H["analysis.ipynb<br/>kiértékelés"]
     E --> H
@@ -117,6 +145,7 @@ flowchart LR
 | `model.py` | a GPT és a Differential Transformer modell; közvetlenül futtatva öntesztet végez |
 | `train.py` | tanítás early stoppinggal; a legjobb modellt a `checkpoints/` mappába menti |
 | `generate.py` | szöveggenerálás egy checkpointból (temperature, top-k) |
+| `download.py` | letölti a betanított modelleket a GitHub Release-ből (kérésre a forrásszöveget is), és ellenőrzi az ujjlenyomatukat |
 | `ngram_baseline.py` | karakter-szintű N-gram alapmodell |
 | `colab_train.ipynb` | a projekt összes GPU-s tanítása Google Colabon |
 | `analysis.ipynb` | a kiértékelés: táblázatok, statisztika, ábrák |
@@ -126,12 +155,14 @@ flowchart LR
 
 ## Futtatás
 
+A teljes reprodukálás lépései. Ha a gyors tesztet már lefuttattad, a telepítést nem kell megismételni, a `download.py` pedig a már letöltött fájlokat kihagyja.
+
 **Telepítés** (Python 3.12):
 
 ```bash
 conda create -n petofi-gpt python=3.12
 conda activate petofi-gpt
-pip install torch --index-url https://download.pytorch.org/whl/cpu   # GPU nélküli gépen
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # PyTorch CPU-s változata (kisebb letöltés)
 pip install -r requirements.txt
 ```
 
@@ -144,7 +175,7 @@ python model.py           # a modell öntesztje
 
 A forrásfájl ujjlenyomata (SHA-256) a `data/meta.json`-ba kerül. Ha ez `aa7655a76f03…`-mal kezdődik, a felosztás pontosan ugyanaz, mint a projektben.
 
-Ha a Project Gutenberg éppen nem érhető el, a forrásfájl (`pg41504.txt`) a [Releases](https://github.com/janosibenedek/petofi-gpt/releases/latest) oldalról is letölthető. Tedd a repó mappájába, és futtasd így: `python prepare_data.py --raw-file pg41504.txt`.
+Ha a Project Gutenberg éppen nem érhető el, a `python download.py --source` ugyanezt a forrásfájlt a Release-ből tölti le a `data/raw/` mappába. Utána a `python prepare_data.py` már ezt használja, letöltés nélkül.
 
 **Tanítás:**
 
@@ -177,13 +208,20 @@ python ngram_baseline.py --smoothing add1 --out results/ngram_add1.json
 python generate.py --checkpoint checkpoints/colab_drop03.pt --prompt "Szabadság, szerelem!\n" --temperature 0.8
 ```
 
-**Elemzés:** az `analysis.ipynb` futtatásához kell a `data/` mappa és mind a 8 checkpoint a `checkpoints/` mappában. CPU-n kb. 10–15 perc.
+**Elemzés** (`analysis.ipynb`, CPU-n kb. 10–15 perc):
+
+```bash
+python prepare_data.py    # ha még nincs data/ mappa
+python download.py        # mind a 8 checkpoint (kb. 310 MB)
+```
+
+Ezután a notebookban *Run All*.
 
 ---
 
 ## Modellsúlyok
 
-Mind a 8 checkpoint letölthető a [Releases](https://github.com/janosibenedek/petofi-gpt/releases/latest) oldalról; a fájlokat a `checkpoints/` mappába kell tenni.
+Mind a 8 checkpoint a [Releases](https://github.com/janosibenedek/petofi-gpt/releases/latest) oldalon van. A legegyszerűbb a `python download.py`: a `checkpoints/` mappába tölti őket, és ellenőrzi az ujjlenyomatukat (`--quick`: csak a kis modell, `--final`: csak a két végleges).
 
 | Checkpoint | Szerepe |
 |---|---|
@@ -203,15 +241,17 @@ print(generate_text(model, vocab, "Szabadság, szerelem!\n", max_new_tokens=300,
                     temperature=0.8, top_k=None, seed=42))
 ```
 
-Minden checkpoint eltárolja azokat a parancssori beállításokat is, amelyekkel tanították (`args`). Az első öt Colab-futás (`colab`, `colab_drop03`, `colab_drop04`, `colab_drop03_relu`, `colab_drop03_nores`) még azelőtt készült, hogy a Differential Transformer, és vele az `--attention` kapcsoló bekerült a kódba. Ezért náluk az `args`-ban nincs `attention` kulcs: ezek a normál figyelemmel tanultak, ami ma is az alapértelmezés.
+Minden checkpoint eltárolja azokat a parancssori beállításokat is, amelyekkel tanították (`args`). A `cpu.pt` és az első öt Colab-futás (`colab`, `colab_drop03`, `colab_drop04`, `colab_drop03_relu`, `colab_drop03_nores`) még azelőtt készült, hogy a Differential Transformer, és vele az `--attention` kapcsoló bekerült a kódba. Ezért náluk az `args`-ban nincs `attention` kulcs: ezek a normál figyelemmel tanultak, ami ma is az alapértelmezés.
 
 ---
 
 ## Korlátok
 
-- Minden beállítással csak egy tanítás futott, ezért a nagyon kis különbségek (pl. ReLU vs. GELU) bizonytalanok.
-- Kis modell, rövid kontextus: a Differential Transformerről kapott eredmény csak erre a méretre érvényes.
-- Karakter-szintű modell 19. századi helyesírással: nem létező szavakat is generálhat.
+- **Egy tanítás beállításonként.** Minden beállítással egyetlen tanítás futott (egy seed), ezért a nagyon kis különbségek bizonytalanok. A ReLU kb. 0,65%-os előnye így nem tekinthető valódinak, ezért maradt a végleges modell GELU-s.
+- **Differential Transformer:** csak a dropoutját hangoltuk, a tanulási ráta és a többi beállítás ugyanaz maradt, mint a GPT-nél. Az eredmény erre a méretre (10,8 M paraméter, 256 karakteres kontextus) és ezekre a beállításokra érvényes.
+- **Csak lírai tesztversek.** A hosszú elbeszélő költemények (pl. *János vitéz*, *Az apostol*) mind a train halmazba kerültek, a teszthalmaz rövidebb, lírai versekből áll. Az eredmények tehát a lírai versekre érvényesek.
+- **A kis modell nem tanult ki.** A CPU-s modell a 3000. lépésnél, a lépéskeret végén állt le, miközben a val loss még javult. A „nagy vs. kis” összevetés így részben a tanítás hosszát is méri, nem csak a modell méretét.
+- **Karakter-szintű modell** 19. századi helyesírással: nem létező szavakat is generálhat.
 
 ## Források és licenc
 
@@ -239,4 +279,6 @@ A character-level GPT (10.8M parameters) written from scratch in PyTorch and tra
 - **Ablations:** without residual connections the model does not learn beyond letter frequencies; ReLU vs. GELU makes practically no difference (single seed).
 - **Sampling:** temperature and top-k trade correctness for diversity; 0.8–1.0 is a good balance.
 
-Hyperparameters were chosen on the validation split only; the test split was used once. Confidence intervals: bootstrap over the 117 test poems. To reproduce, see [Futtatás](#futtatás) (commands), [`colab_train.ipynb`](colab_train.ipynb) (GPU training) and [`analysis.ipynb`](analysis.ipynb) (evaluation); trained weights are on the [Releases](https://github.com/janosibenedek/petofi-gpt/releases/latest) page.
+Hyperparameters were chosen on the validation split only; the test split was used once. Confidence intervals: bootstrap over the 117 test poems. Limitations: one training run (seed) per setting; only dropout was tuned for the Differential Transformer; the test split contains only lyric poems; the small CPU model stopped at its step limit.
+
+**Quick test** (CPU, about 5 minutes): `python model.py`, then `python download.py --quick` and `python generate.py --checkpoint checkpoints/cpu.pt` (see [Gyors teszt](#gyors-teszt-kb-5-perc-gpu-nélkül)). To reproduce everything, see [Futtatás](#futtatás) (commands), [`colab_train.ipynb`](colab_train.ipynb) (GPU training) and [`analysis.ipynb`](analysis.ipynb) (evaluation); `python download.py` downloads all trained weights from the [Releases](https://github.com/janosibenedek/petofi-gpt/releases/latest) page.
